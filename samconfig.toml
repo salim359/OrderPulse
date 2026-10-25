@@ -1,0 +1,13 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "notification-sys"
+resolve_s3 = true
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+fail_on_empty_changeset = false
+region = "us-east-1"
+parameter_overrides = "ProjectName=notification-sys"
+
+[default.global.parameters]
+region = "us-east-1"

@@ -1,0 +1,8 @@
+[
+  {
+    "Source": "demo.orders",
+    "DetailType": "PaymentFailed",
+    "Detail": "{\"orderId\":\"ord-1001\",\"customerId\":\"cust-42\",\"customerEmail\":\"snoufa3@gmail.com\",\"totalAmount\":49.99,\"currency\":\"USD\",\"failureCode\":\"card_declined\"}",
+    "EventBusName": "EVENT_BUS_NAME_PLACEHOLDER"
+  }
+]

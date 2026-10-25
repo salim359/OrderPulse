@@ -1,0 +1,8 @@
+[
+  {
+    "Source": "demo.orders",
+    "DetailType": "OrderUpdated",
+    "Detail": "{\"orderId\":\"ord-1001\",\"status\":\"SHIPPED\"}",
+    "EventBusName": "EVENT_BUS_NAME_PLACEHOLDER"
+  }
+]

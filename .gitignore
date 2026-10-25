@@ -1,0 +1,44 @@
+# SAM build artifacts
+.aws-sam/
+samconfig.toml.bak
+
+# TypeScript / Node (workers)
+src/node_modules/
+src/dist/
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Packaging
+*.zip
+packaged.yaml
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+*.pem
+credentials
+aws-exports.js
+
+# Logs & coverage
+logs/
+*.log
+npm-debug.log*
+coverage/
+.nyc_output/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Python leftovers (if any local scripts)
+__pycache__/
+*.py[cod]
+.venv/
+venv/

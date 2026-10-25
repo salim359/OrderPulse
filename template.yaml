@@ -1,0 +1,710 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  OrderPulse — Event-Driven Notification Service.
+  OrderCreated → EventBridge → SNS → Email & Audit SQS → Lambda workers.
+  Email worker sends via SES and logs to DynamoDB; audit worker writes a trail.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: notification-sys
+    Description: Prefix for resource names (bus, rule, queues, topic must stay consistent)
+
+  SenderEmail:
+    Type: String
+    Default: orders@dailynonsensia.site
+    Description: Verified SES From address (domain or email identity)
+
+  AlarmEmail:
+    Type: String
+    Default: snoufa3@gmail.com
+    Description: >
+      Email for CloudWatch alarm notifications (empty string skips subscription).
+      Must be able to confirm the SNS subscription.
+
+  EnableSesTracking:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Create SES configuration set and publish open/click/bounce metrics to CloudWatch
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+  SesTrackingEnabled: !Equals [!Ref EnableSesTracking, "true"]
+
+Globals:
+  Function:
+    Runtime: nodejs24.x
+    Timeout: 15
+    MemorySize: 256
+    Architectures:
+      - x86_64
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Custom event bus for order domain events
+  # ---------------------------------------------------------------------------
+  OrdersEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${ProjectName}-orders'
+      # TRACE: Event Ingested → Rule Matching → Rule Matched / No Rules Matched
+      #        → Invocation Started/Succeeded (SNS fan-out) → retries/DLQ
+      LogConfig:
+        Level: TRACE
+        IncludeDetail: FULL
+
+  # ---------------------------------------------------------------------------
+  # Event bus → CloudWatch Logs (pipeline visibility)
+  # ---------------------------------------------------------------------------
+  EventBusLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/vendedlogs/events/event-bus/${ProjectName}-orders'
+      RetentionInDays: 14
+
+  EventBusInfoLogsSource:
+    Type: AWS::Logs::DeliverySource
+    Properties:
+      Name: !Sub '${ProjectName}-bus-info'
+      ResourceArn: !GetAtt OrdersEventBus.Arn
+      LogType: INFO_LOGS
+
+  EventBusErrorLogsSource:
+    Type: AWS::Logs::DeliverySource
+    Properties:
+      Name: !Sub '${ProjectName}-bus-error'
+      ResourceArn: !GetAtt OrdersEventBus.Arn
+      LogType: ERROR_LOGS
+
+  EventBusTraceLogsSource:
+    Type: AWS::Logs::DeliverySource
+    Properties:
+      Name: !Sub '${ProjectName}-bus-trace'
+      ResourceArn: !GetAtt OrdersEventBus.Arn
+      LogType: TRACE_LOGS
+
+  EventBusLogsDestination:
+    Type: AWS::Logs::DeliveryDestination
+    Properties:
+      Name: !Sub '${ProjectName}-bus-cwlogs'
+      DestinationResourceArn: !GetAtt EventBusLogGroup.Arn
+      OutputFormat: json
+
+  EventBusLogsResourcePolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-eventbus-log-delivery'
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "AWSLogDeliveryWrite",
+              "Effect": "Allow",
+              "Principal": { "Service": "delivery.logs.amazonaws.com" },
+              "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+              "Resource": "${EventBusLogGroup.Arn}:log-stream:*",
+              "Condition": {
+                "StringEquals": { "aws:SourceAccount": "${AWS::AccountId}" },
+                "ArnLike": {
+                  "aws:SourceArn": [
+                    "${EventBusInfoLogsSource.Arn}",
+                    "${EventBusErrorLogsSource.Arn}",
+                    "${EventBusTraceLogsSource.Arn}"
+                  ]
+                }
+              }
+            }
+          ]
+        }
+
+  EventBusInfoLogsDelivery:
+    Type: AWS::Logs::Delivery
+    DependsOn: EventBusLogsResourcePolicy
+    Properties:
+      DeliverySourceName: !Sub '${ProjectName}-bus-info'
+      DeliveryDestinationArn: !GetAtt EventBusLogsDestination.Arn
+
+  EventBusErrorLogsDelivery:
+    Type: AWS::Logs::Delivery
+    DependsOn:
+      - EventBusLogsResourcePolicy
+      - EventBusInfoLogsDelivery
+    Properties:
+      DeliverySourceName: !Sub '${ProjectName}-bus-error'
+      DeliveryDestinationArn: !GetAtt EventBusLogsDestination.Arn
+
+  EventBusTraceLogsDelivery:
+    Type: AWS::Logs::Delivery
+    DependsOn:
+      - EventBusLogsResourcePolicy
+      - EventBusErrorLogsDelivery
+    Properties:
+      DeliverySourceName: !Sub '${ProjectName}-bus-trace'
+      DeliveryDestinationArn: !GetAtt EventBusLogsDestination.Arn
+
+  # ---------------------------------------------------------------------------
+  # SNS topic: fan-out hub for matched OrderCreated events
+  # ---------------------------------------------------------------------------
+  OrderNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-order-notifications'
+      DisplayName: Order notifications fan-out
+
+  OrderNotificationsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref OrderNotificationsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref OrderNotificationsTopic
+            Condition:
+              ForAnyValue:ArnEquals:
+                aws:SourceArn:
+                  - !GetAtt OrderCreatedRule.Arn
+                  - !GetAtt OrderCancelledRule.Arn
+                  - !GetAtt PaymentFailedRule.Arn
+
+  # ---------------------------------------------------------------------------
+  # SQS: worker queues + per-queue DLQs + EventBridge target DLQ
+  # VisibilityTimeout >= 6x Lambda timeout (AWS guidance)
+  # ---------------------------------------------------------------------------
+  EmailQueueDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-email-dlq'
+      MessageRetentionPeriod: 1209600
+      VisibilityTimeout: 30
+
+  AuditQueueDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-audit-dlq'
+      MessageRetentionPeriod: 1209600
+      VisibilityTimeout: 30
+
+  EmailQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-email'
+      MessageRetentionPeriod: 345600
+      VisibilityTimeout: 90
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt EmailQueueDLQ.Arn
+        maxReceiveCount: 3
+
+  AuditQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-audit'
+      MessageRetentionPeriod: 1209600
+      VisibilityTimeout: 90
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt AuditQueueDLQ.Arn
+        maxReceiveCount: 3
+
+  EventBridgeDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-eventbridge-dlq'
+      MessageRetentionPeriod: 1209600
+      VisibilityTimeout: 30
+
+  EmailQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref EmailQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSNSSendMessage
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt EmailQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref OrderNotificationsTopic
+
+  AuditQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref AuditQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSNSSendMessage
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt AuditQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref OrderNotificationsTopic
+
+  EventBridgeDLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref EventBridgeDLQ
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgeSendMessage
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt EventBridgeDLQ.Arn
+            Condition:
+              ForAnyValue:ArnEquals:
+                aws:SourceArn:
+                  - !GetAtt OrderCreatedRule.Arn
+                  - !GetAtt OrderCancelledRule.Arn
+                  - !GetAtt PaymentFailedRule.Arn
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    DependsOn: EmailQueuePolicy
+    Properties:
+      Protocol: sqs
+      TopicArn: !Ref OrderNotificationsTopic
+      Endpoint: !GetAtt EmailQueue.Arn
+      RawMessageDelivery: true
+
+  AuditSubscription:
+    Type: AWS::SNS::Subscription
+    DependsOn: AuditQueuePolicy
+    Properties:
+      Protocol: sqs
+      TopicArn: !Ref OrderNotificationsTopic
+      Endpoint: !GetAtt AuditQueue.Arn
+      RawMessageDelivery: true
+
+  # ---------------------------------------------------------------------------
+  # EventBridge rules (separate rules per detail-type → same SNS fan-out)
+  # ---------------------------------------------------------------------------
+  OrderCreatedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-order-created'
+      Description: Route OrderCreated events to SNS for fan-out
+      EventBusName: !Ref OrdersEventBus
+      State: ENABLED
+      EventPattern:
+        source:
+          - demo.orders
+        detail-type:
+          - OrderCreated
+      Targets:
+        - Id: OrderNotificationsTopic
+          Arn: !Ref OrderNotificationsTopic
+          DeadLetterConfig:
+            Arn: !GetAtt EventBridgeDLQ.Arn
+
+  OrderCancelledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-order-cancelled'
+      Description: Route OrderCancelled events to SNS for fan-out
+      EventBusName: !Ref OrdersEventBus
+      State: ENABLED
+      EventPattern:
+        source:
+          - demo.orders
+        detail-type:
+          - OrderCancelled
+      Targets:
+        - Id: OrderNotificationsTopic
+          Arn: !Ref OrderNotificationsTopic
+          DeadLetterConfig:
+            Arn: !GetAtt EventBridgeDLQ.Arn
+
+  PaymentFailedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-payment-failed'
+      Description: Route PaymentFailed events to SNS for fan-out
+      EventBusName: !Ref OrdersEventBus
+      State: ENABLED
+      EventPattern:
+        source:
+          - demo.orders
+        detail-type:
+          - PaymentFailed
+      Targets:
+        - Id: OrderNotificationsTopic
+          Arn: !Ref OrderNotificationsTopic
+          DeadLetterConfig:
+            Arn: !GetAtt EventBridgeDLQ.Arn
+
+  # ---------------------------------------------------------------------------
+  # DynamoDB — notification log + audit trail
+  # ---------------------------------------------------------------------------
+  NotificationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-notifications'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: notificationId
+          AttributeType: S
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: notificationId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: by-order
+          KeySchema:
+            - AttributeName: orderId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  AuditTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-audit-trail'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: auditId
+          AttributeType: S
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: recordedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: auditId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: by-order
+          KeySchema:
+            - AttributeName: orderId
+              KeyType: HASH
+            - AttributeName: recordedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # ---------------------------------------------------------------------------
+  # SES configuration set (open / click / bounce → CloudWatch)
+  # ---------------------------------------------------------------------------
+  EmailConfigurationSet:
+    Type: AWS::SES::ConfigurationSet
+    Condition: SesTrackingEnabled
+    Properties:
+      Name: !Sub '${ProjectName}-email-events'
+
+  EmailConfigurationSetEventDestination:
+    Type: AWS::SES::ConfigurationSetEventDestination
+    Condition: SesTrackingEnabled
+    Properties:
+      ConfigurationSetName: !Ref EmailConfigurationSet
+      EventDestination:
+        Name: cloudwatch-engagement
+        Enabled: true
+        MatchingEventTypes:
+          - send
+          - reject
+          - bounce
+          - complaint
+          - delivery
+          - open
+          - click
+        CloudWatchDestination:
+          DimensionConfigurations:
+            - DimensionName: messageType
+              DimensionValueSource: messageTag
+              DefaultDimensionValue: OrderCreated
+
+  # ---------------------------------------------------------------------------
+  # Alarms — worker errors + queue DLQ depth
+  # ---------------------------------------------------------------------------
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-alarms'
+      DisplayName: OrderPulse alarms
+
+  AlarmTopicEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AlarmTopic
+      Endpoint: !Ref AlarmEmail
+
+  EmailWorkerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-email-worker-errors'
+      AlarmDescription: Email worker Lambda reported errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EmailWorkerFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+
+  AuditWorkerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-audit-worker-errors'
+      AlarmDescription: Audit worker Lambda reported errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AuditWorkerFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+
+  EmailQueueDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-email-dlq-depth'
+      AlarmDescription: Messages sitting on the email worker DLQ
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt EmailQueueDLQ.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  AuditQueueDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-audit-dlq-depth'
+      AlarmDescription: Messages sitting on the audit worker DLQ
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt AuditQueueDLQ.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  EventBridgeDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-eventbridge-dlq-depth'
+      AlarmDescription: Failed EventBridge → SNS deliveries
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt EventBridgeDLQ.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  # ---------------------------------------------------------------------------
+  # Workers
+  # ---------------------------------------------------------------------------
+  EmailWorkerFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub '${ProjectName}-email-worker'
+      CodeUri: src/
+      Handler: email_worker/app.handler
+      Description: Send order emails via SES and log to DynamoDB (TypeScript)
+      Environment:
+        Variables:
+          NOTIFICATIONS_TABLE: !Ref NotificationsTable
+          QUEUE_NAME: email
+          SENDER_EMAIL: !Ref SenderEmail
+          SES_CONFIGURATION_SET: !If
+            - SesTrackingEnabled
+            - !Ref EmailConfigurationSet
+            - ""
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NotificationsTable
+        - Statement:
+            - Sid: AllowSesSend
+              Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: "*"
+      Events:
+        EmailQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt EmailQueue.Arn
+            BatchSize: 5
+
+  AuditWorkerFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub '${ProjectName}-audit-worker'
+      CodeUri: src/
+      Handler: audit_worker/app.handler
+      Description: Write audit trail rows from AuditQueue messages (TypeScript)
+      Environment:
+        Variables:
+          AUDIT_TABLE: !Ref AuditTable
+          QUEUE_NAME: audit
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AuditTable
+      Events:
+        AuditQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt AuditQueue.Arn
+            BatchSize: 5
+
+Outputs:
+  EventBusName:
+    Description: Custom EventBridge bus for order events
+    Value: !Ref OrdersEventBus
+
+  EventBusArn:
+    Description: ARN of the orders event bus
+    Value: !GetAtt OrdersEventBus.Arn
+
+  TopicArn:
+    Description: SNS topic that fans out OrderCreated events
+    Value: !Ref OrderNotificationsTopic
+
+  EmailQueueUrl:
+    Description: SQS queue URL for email-side processing
+    Value: !Ref EmailQueue
+
+  AuditQueueUrl:
+    Description: SQS queue URL for audit logging
+    Value: !Ref AuditQueue
+
+  EventBridgeDLQUrl:
+    Description: SQS queue URL for failed EventBridge target deliveries
+    Value: !Ref EventBridgeDLQ
+
+  EmailQueueDLQUrl:
+    Description: DLQ for email worker poison messages
+    Value: !Ref EmailQueueDLQ
+
+  AuditQueueDLQUrl:
+    Description: DLQ for audit worker poison messages
+    Value: !Ref AuditQueueDLQ
+
+  AlarmTopicArn:
+    Description: SNS topic for CloudWatch alarm notifications
+    Value: !Ref AlarmTopic
+
+  SesConfigurationSetName:
+    Condition: SesTrackingEnabled
+    Description: SES configuration set used for open/click/bounce tracking
+    Value: !Ref EmailConfigurationSet
+
+  NotificationsTableName:
+    Description: DynamoDB table for simulated email notifications
+    Value: !Ref NotificationsTable
+
+  AuditTableName:
+    Description: DynamoDB table for the audit trail
+    Value: !Ref AuditTable
+
+  EmailWorkerFunctionName:
+    Description: Lambda that processes the email queue
+    Value: !Ref EmailWorkerFunction
+
+  SenderEmail:
+    Description: SES From address used by the email worker
+    Value: !Ref SenderEmail
+
+  AuditWorkerFunctionName:
+    Description: Lambda that processes the audit queue
+    Value: !Ref AuditWorkerFunction
+
+  OrderCreatedRuleArn:
+    Description: ARN of the OrderCreated rule (used by topic/DLQ policies)
+    Value: !GetAtt OrderCreatedRule.Arn
+
+  OrderCreatedRuleName:
+    Description: EventBridge rule name for OrderCreated
+    Value: !Ref OrderCreatedRule
+
+  OrderCancelledRuleName:
+    Description: EventBridge rule name for OrderCancelled
+    Value: !Ref OrderCancelledRule
+
+  PaymentFailedRuleName:
+    Description: EventBridge rule name for PaymentFailed
+    Value: !Ref PaymentFailedRule
+
+  StackRegion:
+    Description: Region where the stack is deployed
+    Value: !Ref AWS::Region
+
+  EventBusLogGroupName:
+    Description: CloudWatch log group for EventBridge TRACE (ingest, rule match, fan-out)
+    Value: !Ref EventBusLogGroup
+
+  EmailWorkerLogGroupName:
+    Description: CloudWatch log group for email worker (queue_landed / fanout_consumed)
+    Value: !Sub '/aws/lambda/${ProjectName}-email-worker'
+
+  AuditWorkerLogGroupName:
+    Description: CloudWatch log group for audit worker (queue_landed / fanout_consumed)
+    Value: !Sub '/aws/lambda/${ProjectName}-audit-worker'
